@@ -52,30 +52,63 @@ void AlltoAllvReadTrafficMatrix(int nranks) {
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
 
+  // Read lines until we have nranks or hit EOF
+  std::vector<std::string> lines;
+  std::string line;
+  int matrix_len = 0;
+  while (matrix_len < nranks && std::getline(file, line)) {
+    if (!line.empty()) {
+      lines.push_back(line);
+      matrix_len++;
+    }
+  }
+
+  // Validate that we have enough ranks in the matrix
+  if (matrix_len < nranks) {
+    if (rank == 0) {
+      printf("Error: Requested nranks (%d) is larger than matrix size (%d) in file %s.\n", 
+             nranks, matrix_len, matrix_file);
+    }
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
   traffic_matrix.clear();
   traffic_matrix.resize(nranks, std::vector<size_t>(nranks));
 
-  std::string line;
-  for (int i = 0; i < nranks && std::getline(file, line); i++) {
-    std::stringstream ss(line);
+  // Single pass: validate columns and assign values
+  for (int i = 0; i < nranks; i++) {
+    std::stringstream ss(lines[i]);
     std::string cell;
+    int j = 0;
+    while (std::getline(ss, cell, ' ')) {
+      if (!cell.empty()) {
+        if (j >= nranks) {
+          // More columns than needed, ignore the rest
+          break;
+        }
+        traffic_matrix[i][j] = (size_t)std::stod(cell);
+        j++;
+      }
+    }
 
-    // XXX general error handling for parsing matrix file
-    for (int j = 0; j < nranks && std::getline(ss, cell, ' '); j++) {
-      traffic_matrix[i][j] = (size_t)std::stod(cell);
+    if (j < nranks) {
+      if (rank == 0) {
+        printf("Error: Row %d has only %d columns in file %s, but nranks is %d.\n",
+               i, j, matrix_file, nranks);
+      }
+      MPI_Abort(MPI_COMM_WORLD, 1);
     }
         
     if (enable_debug && rank == 0 && i < 5) {
       printf("[DEBUG] Matrix row %d: ", i);
-      for (int j = 0; j < std::min(nranks, 8); j++) {
-        printf("%zu ", traffic_matrix[i][j]);
+      for (int k = 0; k < std::min(nranks, 8); k++) {
+        printf("%zu ", traffic_matrix[i][k]);
       }
       if (nranks > 8) printf("...");
       printf("\n");
     }
   }
 
-  // XXX handle mismatches between matrix and nranks
   file.close();
 }
 // Get traffic count for src->dst pair
