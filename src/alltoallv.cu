@@ -111,20 +111,6 @@ void AlltoAllvReadTrafficMatrix(int nranks) {
 
   file.close();
 }
-// Get traffic count for src->dst pair
-size_t AlltoAllvGetTrafficCount(int src, int dst, int nranks) {
-  // XXX is this needed? or should the program have exited by now?
-  if (!matrix_loaded) {
-    AlltoAllvReadTrafficMatrix(nranks);
-  }
-
-  // XXX handle this in matrix loop bounds or something. if removed, we can likely drop nranks from the function signature or just remove the function entirely
-  if (src >= nranks || dst >= nranks) {
-    return 0; // No traffic for ranks beyond matrix size
-  }
-
-  return traffic_matrix[src][dst];
-}
 
 void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
 
@@ -141,14 +127,14 @@ void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *par
 
   // Calculate send count (sum of what this rank sends to all others)
   for (int r = 0; r < nranks; r++) {
-    size_t traffic = AlltoAllvGetTrafficCount(rank, r, nranks);
+    size_t traffic = traffic_matrix[rank][r];
     *sendcount += traffic;
     DEBUG_PRINT_ALL(rank, "Send to rank %d: %zu elements", r, traffic);
   }
 
   // Calculate recv count (sum of what this rank receives from all others)
   for (int r = 0; r < nranks; r++) {
-    size_t traffic = AlltoAllvGetTrafficCount(r, rank, nranks);
+    size_t traffic = traffic_matrix[r][rank];
     *recvcount += traffic;
     DEBUG_PRINT_ALL(rank, "Recv from rank %d: %zu elements", r, traffic);
   }
