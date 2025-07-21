@@ -247,6 +247,15 @@ void AlltoAllvGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, in
 
 testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t type, const char* typeName, ncclRedOp_t op, const char* opName) {
   args->collTest = &alltoAllvTest;
+
+  if (args->reportErrors) {
+    FATAL_ERROR("AlltoAllv does not support data validation. Run with -c 0 to disable data checking.");
+  }
+
+  if (args->minbytes != args->maxbytes) {
+    FATAL_ERROR("AlltoAllv requires single size testing. Set -b and -e to the same value (e.g., -b 32M -e 32M).");
+  }
+
   ncclDataType_t *run_types;
   const char **run_typenames;
   int type_count;
@@ -265,6 +274,7 @@ testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t 
     // Set maxbytes for this specific data type to ensure steps=1 (shift=0)
     size_t max_elements = std::max(global_max_send, global_max_recv);
     args->maxbytes = max_elements * wordSize(run_types[i]);
+
     TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], (ncclRedOp_t)0, "none", -1));
   }
   return testSuccess;
