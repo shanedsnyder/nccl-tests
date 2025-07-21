@@ -9,27 +9,39 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
+#include <string>
 
-#define DEBUG_PRINT(rank, fmt, ...) \
+#define DEBUG_PRINT(fmt, ...) \
   do { \
-    if (enable_debug && rank == 0) { \
+    if (enable_debug && mpi_rank == 0) { \
       printf("[DEBUG] " fmt "\n", ##__VA_ARGS__); \
     } \
   } while(0)
 
-#define DEBUG_PRINT_ALL(rank, fmt, ...) \
+#define DEBUG_PRINT_ALL(fmt, ...) \
   do { \
     if (enable_debug) { \
-      printf("[DEBUG rank %d] " fmt "\n", rank, ##__VA_ARGS__); \
+      printf("[DEBUG rank %d] " fmt "\n", mpi_rank, ##__VA_ARGS__); \
     } \
   } while(0)
 
+#define FATAL_ERROR(fmt, ...) \
+  do { \
+    if (mpi_rank == 0) { \
+      printf("Error: " fmt "\n", ##__VA_ARGS__); \
+    } \
+    MPI_Abort(MPI_COMM_WORLD, 1); \
+  } while(0)
+
 // Global variables for AlltoAllv traffic matrix and options
-static int rank;
+static int mpi_rank;
 static bool enable_debug = false;
 static char* matrix_file = nullptr; // XXX default in-tree matrix file?
 static std::vector<std::vector<size_t>> traffic_matrix;
 static bool matrix_loaded = false;
+static size_t global_max_send = 0;
+static size_t global_max_recv = 0;
 
 void AlltoAllvParseEnv() {
   const char* matrix_file_env = getenv("ALLTOALLV_MATRIX_FILE");
@@ -39,17 +51,11 @@ void AlltoAllvParseEnv() {
 
 void AlltoAllvReadTrafficMatrix(int nranks) {
   if (!matrix_file) {
-    if (rank == 0) {
-      printf("Error: No matrix file specified. Use ALLTOALLV_MATRIX_FILE env var.\n");
-    }
-    MPI_Abort(MPI_COMM_WORLD, 1);
+    FATAL_ERROR("No matrix file specified. Use ALLTOALLV_MATRIX_FILE env var.");
   }
   std::ifstream file(matrix_file);
   if (!file.is_open()) {
-    if (rank == 0) {
-      printf("Error: Unable to open matrix file %s.\n", matrix_file);
-    }
-    MPI_Abort(MPI_COMM_WORLD, 1);
+    FATAL_ERROR("Unable to open matrix file %s.", matrix_file);
   }
 
   // Read lines until we have nranks or hit EOF
@@ -65,11 +71,8 @@ void AlltoAllvReadTrafficMatrix(int nranks) {
 
   // Validate that we have enough ranks in the matrix
   if (matrix_len < nranks) {
-    if (rank == 0) {
-      printf("Error: Requested nranks (%d) is larger than matrix size (%d) in file %s.\n", 
-             nranks, matrix_len, matrix_file);
-    }
-    MPI_Abort(MPI_COMM_WORLD, 1);
+    FATAL_ERROR("Requested nranks (%d) is larger than matrix size (%d) in file %s.",
+                nranks, matrix_len, matrix_file);
   }
 
   traffic_matrix.clear();
@@ -92,63 +95,71 @@ void AlltoAllvReadTrafficMatrix(int nranks) {
     }
 
     if (j < nranks) {
-      if (rank == 0) {
-        printf("Error: Row %d has only %d columns in file %s, but nranks is %d.\n",
-               i, j, matrix_file, nranks);
-      }
-      MPI_Abort(MPI_COMM_WORLD, 1);
+      FATAL_ERROR("Row %d has only %d columns in file %s, but nranks is %d.",
+                  i, j, matrix_file, nranks);
     }
         
-    if (enable_debug && rank == 0 && i < 5) {
-      printf("[DEBUG] Matrix row %d: ", i);
+    if (enable_debug && mpi_rank == 0 && i < 5) {
+      std::stringstream debug_ss;
+      debug_ss << "Matrix row " << i << ": ";
       for (int k = 0; k < std::min(nranks, 8); k++) {
-        printf("%zu ", traffic_matrix[i][k]);
+        debug_ss << traffic_matrix[i][k] << " ";
       }
-      if (nranks > 8) printf("...");
-      printf("\n");
+      if (nranks > 8) debug_ss << "...";
+      DEBUG_PRINT("%s", debug_ss.str().c_str());
     }
   }
 
   file.close();
+  DEBUG_PRINT("Successfully loaded traffic matrix (%dx%d) from %s", nranks, nranks, matrix_file);
 }
 
 void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
 
   // Try to load traffic matrix into memory on first call
   if (!matrix_loaded) {
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);  // Only needed for debug printing
     AlltoAllvParseEnv();
     AlltoAllvReadTrafficMatrix(nranks);
     matrix_loaded = true;
   }
 
+  // Calculate maximum send/receive counts across ALL ranks
   *sendcount = 0;
   *recvcount = 0;
 
-  // Calculate send count (sum of what this rank sends to all others)
-  for (int r = 0; r < nranks; r++) {
-    size_t traffic = traffic_matrix[rank][r];
-    *sendcount += traffic;
-    DEBUG_PRINT_ALL(rank, "Send to rank %d: %zu elements", r, traffic);
+  for (int i = 0; i < nranks; i++) {
+    size_t rank_sendcount = 0;
+    size_t rank_recvcount = 0;
+
+    for (int j = 0; j < nranks; j++) {
+      rank_sendcount += traffic_matrix[i][j];  // What rank i sends total
+      rank_recvcount += traffic_matrix[j][i];  // What rank i receives total
+    }
+
+    *sendcount = std::max(*sendcount, rank_sendcount);
+    *recvcount = std::max(*recvcount, rank_recvcount);
+
+    DEBUG_PRINT_ALL("Rank %d: send %zu, recv %zu", i, rank_sendcount, rank_recvcount);
   }
 
-  // Calculate recv count (sum of what this rank receives from all others)
-  for (int r = 0; r < nranks; r++) {
-    size_t traffic = traffic_matrix[r][rank];
-    *recvcount += traffic;
-    DEBUG_PRINT_ALL(rank, "Recv from rank %d: %zu elements", r, traffic);
-  }
+  DEBUG_PRINT_ALL("Max buffer sizes - Send: %zu, Recv: %zu", *sendcount, *recvcount);
 
-  DEBUG_PRINT_ALL(rank, "Buffer sizes - Send: %zu, Recv: %zu", *sendcount, *recvcount);
+  // Avoid recalculating this later
+  global_max_send = *sendcount;
+  global_max_recv = *recvcount;
 
-// XXX double check paramcount is right for alltoallv
+  // For AlltoAllv, paramcount isn't used in the traditional sense since we don't call
+  // a single NCCL collective. However, we need to set it for interface compatibility.
+  // We'll use the overall input count divided by the number of ranks as a representative value.
   *paramcount = (count/nranks) & -(16/eltSize);
+
+  // AlltoAllv doesn't support in-place operations
   *sendInplaceOffset = 0;
   *recvInplaceOffset = 0;
-  fprintf(stderr, "SDS     AlltoAllvGetCollByteCount: count=%zu, eltSize=%zu, nranks=%d, paramcount=%zu, sendcount=%zu, recvcount=%zu\n", count, eltSize, nranks, *paramcount, *sendcount, *recvcount);
-  exit(1);
 }
 
+// XXX This needs to be fixed to support data validation
 testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int rep, int in_place) {
   size_t sendcount = args->sendBytes / wordSize(type);
   size_t recvcount = args->expectedBytes / wordSize(type);
@@ -172,7 +183,15 @@ testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncc
 }
 
 void AlltoAllvGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
-  double baseBw = (double)(count * nranks * typesize) / 1.0E9 / sec;
+  // Calculate total data transferred across all ranks
+  size_t total_count = 0;
+  for (int i = 0; i < nranks; i++) {
+    for (int j = 0; j < nranks; j++) {
+        total_count += traffic_matrix[i][j];
+    }
+  }
+
+  double baseBw = (double)(total_count * typesize) / 1.0E9 / sec;
 
   *algBw = baseBw;
   double factor = ((double)(nranks-1))/((double)(nranks));
@@ -180,20 +199,35 @@ void AlltoAllvGetBw(size_t count, int typesize, double sec, double* algBw, doubl
 }
 
 testResult_t AlltoAllvRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
-  int nRanks;
-  NCCLCHECK(ncclCommCount(comm, &nRanks));
-  size_t rankOffset = count * wordSize(type);
+  int nranks, nccl_rank;
+  NCCLCHECK(ncclCommCount(comm, &nranks));
+  NCCLCHECK(ncclCommUserRank(comm, &nccl_rank));
+  size_t sendOffset = 0, recvOffset = 0;
+
+  DEBUG_PRINT_ALL("Starting AlltoAllv collective (NCCL rank %d)", nccl_rank);
 
 #if NCCL_MAJOR < 2 || NCCL_MINOR < 7
   printf("NCCL 2.7 or later is needed for alltoall. This test was compiled with %d.%d.\n", NCCL_MAJOR, NCCL_MINOR);
   return testNcclError;
 #else
   NCCLCHECK(ncclGroupStart());
-  for (int r=0; r<nRanks; r++) {
-    NCCLCHECK(ncclSend(((char*)sendbuff)+r*rankOffset, count, type, r, comm, stream));
-    NCCLCHECK(ncclRecv(((char*)recvbuff)+r*rankOffset, count, type, r, comm, stream));
+  for (int r=0; r<nranks; r++) {
+    // Use traffic matrix for variable send/recv counts
+    size_t sendCount = traffic_matrix[nccl_rank][r];
+    size_t recvCount = traffic_matrix[r][nccl_rank];
+    if (sendCount > 0) {
+      NCCLCHECK(ncclSend(((char*)sendbuff)+sendOffset, sendCount, type, r, comm, stream));
+      sendOffset += sendCount * wordSize(type);
+    }
+    if (recvCount > 0) {
+      NCCLCHECK(ncclRecv(((char*)recvbuff)+recvOffset, recvCount, type, r, comm, stream));
+      recvOffset += recvCount * wordSize(type);
+    }
   }
   NCCLCHECK(ncclGroupEnd());
+
+  DEBUG_PRINT_ALL("Completed AlltoAllv: sent %zu bytes, received %zu bytes",
+                  sendOffset, recvOffset);
   return testSuccess;
 #endif
 }
@@ -228,6 +262,9 @@ testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t 
   }
 
   for (int i=0; i<type_count; i++) {
+    // Set maxbytes for this specific data type to ensure steps=1 (shift=0)
+    size_t max_elements = std::max(global_max_send, global_max_recv);
+    args->maxbytes = max_elements * wordSize(run_types[i]);
     TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], (ncclRedOp_t)0, "none", -1));
   }
   return testSuccess;
