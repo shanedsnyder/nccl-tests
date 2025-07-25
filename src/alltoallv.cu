@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <string>
 
+// scale input traffic matrix values by a KiB
+#define TRAFFIC_SCALE 1024
+
 #define DEBUG_PRINT(fmt, ...) \
   do { \
     if (enable_debug && mpi_rank == 0) { \
@@ -42,6 +45,7 @@ static std::vector<std::vector<size_t>> traffic_matrix;
 static bool matrix_loaded = false;
 static size_t global_max_send = 0;
 static size_t global_max_recv = 0;
+static size_t rank_send_bytes = 0;
 
 void AlltoAllvParseEnv() {
   const char* matrix_file_env = getenv("ALLTOALLV_MATRIX_FILE");
@@ -89,7 +93,7 @@ void AlltoAllvReadTrafficMatrix(int nranks) {
           // More columns than needed, ignore the rest
           break;
         }
-        traffic_matrix[i][j] = (size_t)std::stod(cell);
+        traffic_matrix[i][j] = (size_t)std::stod(cell) * TRAFFIC_SCALE;
         j++;
       }
     }
@@ -129,21 +133,21 @@ void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *par
   *recvcount = 0;
 
   for (int i = 0; i < nranks; i++) {
-    size_t rank_sendcount = 0;
-    size_t rank_recvcount = 0;
+    size_t rank_sendbytes = 0;
+    size_t rank_recvbytes = 0;
 
     for (int j = 0; j < nranks; j++) {
-      rank_sendcount += traffic_matrix[i][j];  // What rank i sends total
-      rank_recvcount += traffic_matrix[j][i];  // What rank i receives total
+      rank_sendbytes += traffic_matrix[i][j];  // What rank i sends total
+      rank_recvbytes += traffic_matrix[j][i];  // What rank i receives total
     }
 
-    *sendcount = std::max(*sendcount, rank_sendcount);
-    *recvcount = std::max(*recvcount, rank_recvcount);
+    DEBUG_PRINT_ALL("Rank %d: send %zu bytes, recv %zu bytes", i, rank_sendbytes, rank_recvbytes);
 
-    DEBUG_PRINT_ALL("Rank %d: send %zu, recv %zu", i, rank_sendcount, rank_recvcount);
+    *sendcount = std::max(*sendcount, rank_sendbytes/eltSize);
+    *recvcount = std::max(*recvcount, rank_recvbytes/eltSize);
   }
 
-  DEBUG_PRINT_ALL("Max buffer sizes - Send: %zu, Recv: %zu", *sendcount, *recvcount);
+  DEBUG_PRINT_ALL("Max buffer sizes - Send: %zu, Recv: %zu", *sendcount * eltSize, *recvcount * eltSize);
 
   // Avoid recalculating this later
   global_max_send = *sendcount;
@@ -183,15 +187,8 @@ testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncc
 }
 
 void AlltoAllvGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
-  // Calculate total data transferred across all ranks
-  size_t total_count = 0;
-  for (int i = 0; i < nranks; i++) {
-    for (int j = 0; j < nranks; j++) {
-        total_count += traffic_matrix[i][j];
-    }
-  }
-
-  double baseBw = (double)(total_count * typesize) / 1.0E9 / sec;
+  // Calculate total data transferred by this rank (focusing on sent data)
+  double baseBw = (double)(rank_send_bytes) / 1.0E9 / sec;
 
   *algBw = baseBw;
   double factor = ((double)(nranks-1))/((double)(nranks));
@@ -213,18 +210,21 @@ testResult_t AlltoAllvRunColl(void* sendbuff, void* recvbuff, size_t count, nccl
   NCCLCHECK(ncclGroupStart());
   for (int r=0; r<nranks; r++) {
     // Use traffic matrix for variable send/recv counts
-    size_t sendCount = traffic_matrix[nccl_rank][r];
-    size_t recvCount = traffic_matrix[r][nccl_rank];
+    size_t sendBytes = traffic_matrix[nccl_rank][r];
+    size_t sendCount = sendBytes / wordSize(type);
+    size_t recvBytes = traffic_matrix[r][nccl_rank];
+    size_t recvCount = recvBytes / wordSize(type);
     if (sendCount > 0) {
       NCCLCHECK(ncclSend(((char*)sendbuff)+sendOffset, sendCount, type, r, comm, stream));
-      sendOffset += sendCount * wordSize(type);
+      sendOffset += sendBytes;
     }
     if (recvCount > 0) {
       NCCLCHECK(ncclRecv(((char*)recvbuff)+recvOffset, recvCount, type, r, comm, stream));
-      recvOffset += recvCount * wordSize(type);
+      recvOffset += recvBytes;
     }
   }
   NCCLCHECK(ncclGroupEnd());
+  rank_send_bytes = sendOffset;
 
   DEBUG_PRINT_ALL("Completed AlltoAllv: sent %zu bytes, received %zu bytes",
                   sendOffset, recvOffset);
