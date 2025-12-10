@@ -195,41 +195,39 @@ void AlltoAllvGetBw(size_t count, int typesize, double sec, double* algBw, doubl
   *busBw = baseBw * factor;
 }
 
-testResult_t AlltoAllvRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
-  int nranks, nccl_rank;
-  NCCLCHECK(ncclCommCount(comm, &nranks));
-  NCCLCHECK(ncclCommUserRank(comm, &nccl_rank));
-  size_t sendOffset = 0, recvOffset = 0;
-
-  DEBUG_PRINT_ALL("Starting AlltoAllv collective (NCCL rank %d)", nccl_rank);
-
-#if NCCL_MAJOR < 2 || NCCL_MINOR < 7
-  printf("NCCL 2.7 or later is needed for alltoall. This test was compiled with %d.%d.\n", NCCL_MAJOR, NCCL_MINOR);
-  return testNcclError;
+testResult_t AlltoAllvRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl) {
+  if (deviceImpl == 0) {
+    char* sptr = (char*)sendbuff + sendoffset;
+    char* rptr = (char*)recvbuff + recvoffset;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,7,0)
+    int nRanks, ncclRank;
+    NCCLCHECK(ncclCommCount(comm, &nRanks));
+    NCCLCHECK(ncclCommUserRank(comm, &ncclRank));
+    NCCLCHECK(ncclGroupStart());
+    for (int r=0; r<nRanks; r++) {
+      // use traffic matrix for variable send/recv counts
+      size_t sendBytes = traffic_matrix[ncclRank][r];
+      size_t sendCount = sendBytes / wordSize(type);
+      size_t recvBytes = traffic_matrix[r][ncclRank];
+      size_t recvCount = recvBytes / wordSize(type);
+      if (sendCount > 0) {
+        NCCLCHECK(ncclSend(sptr, sendCount, type, r, comm, stream));
+        sptr += sendBytes;
+      }
+      if (recvCount > 0) {
+        NCCLCHECK(ncclRecv(rptr, recvCount, type, r, comm, stream));
+        rptr += recvBytes;
+      }
+    }
+    NCCLCHECK(ncclGroupEnd());
+    return testSuccess;
 #else
-  NCCLCHECK(ncclGroupStart());
-  for (int r=0; r<nranks; r++) {
-    // Use traffic matrix for variable send/recv counts
-    size_t sendBytes = traffic_matrix[nccl_rank][r];
-    size_t sendCount = sendBytes / wordSize(type);
-    size_t recvBytes = traffic_matrix[r][nccl_rank];
-    size_t recvCount = recvBytes / wordSize(type);
-    if (sendCount > 0) {
-      NCCLCHECK(ncclSend(((char*)sendbuff)+sendOffset, sendCount, type, r, comm, stream));
-      sendOffset += sendBytes;
-    }
-    if (recvCount > 0) {
-      NCCLCHECK(ncclRecv(((char*)recvbuff)+recvOffset, recvCount, type, r, comm, stream));
-      recvOffset += recvBytes;
-    }
-  }
-  NCCLCHECK(ncclGroupEnd());
-  rank_send_bytes = sendOffset;
-
-  DEBUG_PRINT_ALL("Completed AlltoAllv: sent %zu bytes, received %zu bytes",
-                  sendOffset, recvOffset);
-  return testSuccess;
+  printf("NCCL 2.7 or later is needed for alltoallv. This test was compiled with %d.%d.\n", NCCL_MAJOR, NCCL_MINOR);
+  return testNcclError;
 #endif
+  } else {
+    return testNotImplemented;
+  }
 }
 
 struct testColl alltoAllvTest = {
@@ -281,8 +279,8 @@ testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t 
 }
 
 struct testEngine alltoAllvEngine = {
-  AlltoAllvGetBuffSize,
-  AlltoAllvRunTest
+  .getBuffSize = AlltoAllvGetBuffSize,
+  .runTest = AlltoAllvRunTest
 };
 
 #pragma weak ncclTestEngine=alltoAllvEngine
