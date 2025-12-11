@@ -163,21 +163,41 @@ void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *par
   *recvInplaceOffset = 0;
 }
 
-// XXX This needs to be fixed to support data validation
 testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int rep, int in_place) {
-  size_t sendcount = args->sendBytes / wordSize(type);
-  size_t recvcount = args->expectedBytes / wordSize(type);
+  size_t eltSz = wordSize(type);
   int nranks = args->nProcs*args->nThreads*args->nGpus;
 
   for (int i=0; i<args->nGpus; i++) {
     CUDACHECK(cudaSetDevice(args->gpus[i]));
     int rank = ((args->proc*args->nThreads + args->thread)*args->nGpus + i);
+
+    // zero out full recv and expected buffers, as expectedBytes is based on max across
+    // ranks (not this rank's exact value) and unused tails must ultimately compare equal
     CUDACHECK(cudaMemset(args->recvbuffs[i], 0, args->expectedBytes));
-    void* data = in_place ? args->recvbuffs[i] : args->sendbuffs[i];
-    TESTCHECK(InitData(data, sendcount, 0, type, ncclSum, 33*rep + rank, 1, 0));
-    for (int j=0; j<nranks; j++) {
-      size_t partcount = sendcount/nranks;
-      TESTCHECK(InitData((char*)args->expected[i] + j*partcount*wordSize(type), partcount, rank*partcount, type, ncclSum, 33*rep + j, 1, 0));
+    CUDACHECK(cudaMemset(args->expected[i], 0, args->expectedBytes));
+
+    // prepare this rank's send buffer
+    size_t mySendBytes = 0;
+    for (int dst = 0; dst < nranks; dst++) mySendBytes += traffic_matrix[rank][dst];
+    size_t mySendCount = mySendBytes / eltSz;
+    if (mySendCount > 0) {
+      void* data = in_place ? args->recvbuffs[i] : args->sendbuffs[i];
+      TESTCHECK(InitData(data, mySendCount, 0, type, ncclSum, 33*rep + rank, 1, 0));
+    }
+
+    // prepare this rank's expected buffer, which is a concatenation of variable-length
+    // segments received from each source in rank order
+    size_t recvOffset = 0;
+    for (int src = 0; src < nranks; src++) {
+      size_t srcRecvBytes = traffic_matrix[src][rank];
+      size_t srcRecvCount = srcRecvBytes / eltSz;
+      if (srcRecvCount == 0) continue;
+      // offset within the source's send stream where my segment begins (in elements)
+      size_t srcOffset = 0;
+      for (int k = 0; k < rank; k++) srcOffset += traffic_matrix[src][k];
+      void* expPtr = (char*)args->expected[i] + recvOffset;
+      TESTCHECK(InitData(expPtr, srcRecvCount, srcOffset / eltSz, type, ncclSum, 33*rep + src, 1, 0));
+      recvOffset += srcRecvBytes;
     }
     CUDACHECK(cudaDeviceSynchronize());
   }
@@ -245,10 +265,6 @@ void AlltoAllvGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, in
 
 testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t type, const char* typeName, ncclRedOp_t op, const char* opName) {
   args->collTest = &alltoAllvTest;
-
-  if (args->reportErrors) {
-    FATAL_ERROR("AlltoAllv does not support data validation. Run with -c 0 to disable data checking.");
-  }
 
   if (args->minbytes != args->maxbytes) {
     FATAL_ERROR("AlltoAllv requires single size testing. Set -b and -e to the same value (e.g., -b 32M -e 32M).");
