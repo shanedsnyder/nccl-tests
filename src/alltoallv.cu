@@ -43,9 +43,8 @@ static bool enable_debug = false;
 static char* matrix_file = nullptr; // XXX default in-tree matrix file?
 static std::vector<std::vector<size_t>> traffic_matrix;
 static bool matrix_loaded = false;
-static size_t global_max_send = 0;
-static size_t global_max_recv = 0;
-static size_t rank_send_bytes = 0;
+static size_t global_max_send_count = 0;
+static size_t global_max_recv_count = 0;
 
 void AlltoAllvParseEnv() {
   const char* matrix_file_env = getenv("ALLTOALLV_MATRIX_FILE");
@@ -150,8 +149,8 @@ void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *par
   DEBUG_PRINT_ALL("Max buffer sizes - Send: %zu, Recv: %zu", *sendcount * eltSize, *recvcount * eltSize);
 
   // Avoid recalculating this later
-  global_max_send = *sendcount;
-  global_max_recv = *recvcount;
+  global_max_send_count = *sendcount;
+  global_max_recv_count = *recvcount;
 
   // For AlltoAllv, paramcount isn't used in the traditional sense since we don't call
   // a single NCCL collective. However, we need to set it for interface compatibility.
@@ -164,7 +163,7 @@ void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *par
 }
 
 testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int rep, int in_place) {
-  size_t eltSz = wordSize(type);
+  size_t elt_size = wordSize(type);
   int nranks = args->nProcs*args->nThreads*args->nGpus;
 
   for (int i=0; i<args->nGpus; i++) {
@@ -177,27 +176,27 @@ testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncc
     CUDACHECK(cudaMemset(args->expected[i], 0, args->expectedBytes));
 
     // prepare this rank's send buffer
-    size_t mySendBytes = 0;
-    for (int dst = 0; dst < nranks; dst++) mySendBytes += traffic_matrix[rank][dst];
-    size_t mySendCount = mySendBytes / eltSz;
-    if (mySendCount > 0) {
+    size_t my_send_bytes = 0;
+    for (int dst = 0; dst < nranks; dst++) my_send_bytes += traffic_matrix[rank][dst];
+    size_t my_send_count = my_send_bytes / elt_size;
+    if (my_send_count > 0) {
       void* data = in_place ? args->recvbuffs[i] : args->sendbuffs[i];
-      TESTCHECK(InitData(data, mySendCount, 0, type, ncclSum, 33*rep + rank, 1, 0));
+      TESTCHECK(InitData(data, my_send_count, 0, type, ncclSum, 33*rep + rank, 1, 0));
     }
 
     // prepare this rank's expected buffer, which is a concatenation of variable-length
     // segments received from each source in rank order
-    size_t recvOffset = 0;
+    size_t recv_offset = 0;
     for (int src = 0; src < nranks; src++) {
-      size_t srcRecvBytes = traffic_matrix[src][rank];
-      size_t srcRecvCount = srcRecvBytes / eltSz;
-      if (srcRecvCount == 0) continue;
+      size_t src_recv_bytes = traffic_matrix[src][rank];
+      size_t src_recv_count = src_recv_bytes / elt_size;
+      if (src_recv_count == 0) continue;
       // offset within the source's send stream where my segment begins (in elements)
-      size_t srcOffset = 0;
-      for (int k = 0; k < rank; k++) srcOffset += traffic_matrix[src][k];
-      void* expPtr = (char*)args->expected[i] + recvOffset;
-      TESTCHECK(InitData(expPtr, srcRecvCount, srcOffset / eltSz, type, ncclSum, 33*rep + src, 1, 0));
-      recvOffset += srcRecvBytes;
+      size_t src_offset = 0;
+      for (int k = 0; k < rank; k++) src_offset += traffic_matrix[src][k];
+      void* exp_ptr = (char*)args->expected[i] + recv_offset;
+      TESTCHECK(InitData(exp_ptr, src_recv_count, src_offset / elt_size, type, ncclSum, 33*rep + src, 1, 0));
+      recv_offset += src_recv_bytes;
     }
     CUDACHECK(cudaDeviceSynchronize());
   }
@@ -207,8 +206,9 @@ testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncc
 }
 
 void AlltoAllvGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
-  // Calculate total data transferred by this rank (focusing on sent data)
-  double baseBw = (double)(rank_send_bytes) / 1.0E9 / sec;
+  // Use max send or recv count across all ranks
+  size_t max_sendrecv_count = std::max(global_max_send_count, global_max_recv_count);
+  double baseBw = (double)(max_sendrecv_count * typesize) / 1.0E9 / sec;
 
   *algBw = baseBw;
   double factor = ((double)(nranks-1))/((double)(nranks));
@@ -220,23 +220,23 @@ testResult_t AlltoAllvRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
     char* sptr = (char*)sendbuff + sendoffset;
     char* rptr = (char*)recvbuff + recvoffset;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,7,0)
-    int nRanks, ncclRank;
-    NCCLCHECK(ncclCommCount(comm, &nRanks));
-    NCCLCHECK(ncclCommUserRank(comm, &ncclRank));
+    int nranks, nccl_rank;
+    NCCLCHECK(ncclCommCount(comm, &nranks));
+    NCCLCHECK(ncclCommUserRank(comm, &nccl_rank));
     NCCLCHECK(ncclGroupStart());
-    for (int r=0; r<nRanks; r++) {
+    for (int r=0; r<nranks; r++) {
       // use traffic matrix for variable send/recv counts
-      size_t sendBytes = traffic_matrix[ncclRank][r];
-      size_t sendCount = sendBytes / wordSize(type);
-      size_t recvBytes = traffic_matrix[r][ncclRank];
-      size_t recvCount = recvBytes / wordSize(type);
-      if (sendCount > 0) {
-        NCCLCHECK(ncclSend(sptr, sendCount, type, r, comm, stream));
-        sptr += sendBytes;
+      size_t send_bytes = traffic_matrix[nccl_rank][r];
+      size_t send_count = send_bytes / wordSize(type);
+      size_t recv_bytes = traffic_matrix[r][nccl_rank];
+      size_t recv_count = recv_bytes / wordSize(type);
+      if (send_count > 0) {
+        NCCLCHECK(ncclSend(sptr, send_count, type, r, comm, stream));
+        sptr += send_bytes;
       }
-      if (recvCount > 0) {
-        NCCLCHECK(ncclRecv(rptr, recvCount, type, r, comm, stream));
-        rptr += recvBytes;
+      if (recv_count > 0) {
+        NCCLCHECK(ncclRecv(rptr, recv_count, type, r, comm, stream));
+        rptr += recv_bytes;
       }
     }
     NCCLCHECK(ncclGroupEnd());
@@ -286,7 +286,7 @@ testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t 
 
   for (int i=0; i<type_count; i++) {
     // Set maxbytes for this specific data type to ensure steps=1 (shift=0)
-    size_t max_elements = std::max(global_max_send, global_max_recv);
+    size_t max_elements = std::max(global_max_send_count, global_max_recv_count);
     //args->maxbytes = max_elements * wordSize(run_types[i]);
 
     TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], (ncclRedOp_t)0, "none", -1));
