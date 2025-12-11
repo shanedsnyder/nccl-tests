@@ -12,9 +12,6 @@
 #include <algorithm>
 #include <string>
 
-// scale input traffic matrix values by a KiB
-#define TRAFFIC_SCALE 1024
-
 #define DEBUG_PRINT(fmt, ...) \
   do { \
     if (enable_debug && mpi_rank == 0) { \
@@ -42,9 +39,8 @@ static int mpi_rank;
 static bool enable_debug = false;
 static char* matrix_file = nullptr; // XXX default in-tree matrix file?
 static std::vector<std::vector<size_t>> traffic_matrix;
-static bool matrix_loaded = false;
-static size_t global_max_send_count = 0;
-static size_t global_max_recv_count = 0;
+static size_t global_max_send_bytes = 0;
+static size_t global_max_recv_bytes = 0;
 
 void AlltoAllvParseEnv() {
   const char* matrix_file_env = getenv("ALLTOALLV_MATRIX_FILE");
@@ -92,7 +88,7 @@ void AlltoAllvReadTrafficMatrix(int nranks) {
           // More columns than needed, ignore the rest
           break;
         }
-        traffic_matrix[i][j] = (size_t)std::stod(cell) * TRAFFIC_SCALE;
+        traffic_matrix[i][j] = (size_t)std::stod(cell);
         j++;
       }
     }
@@ -118,46 +114,13 @@ void AlltoAllvReadTrafficMatrix(int nranks) {
 }
 
 void AlltoAllvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
-
-  // Try to load traffic matrix into memory on first call
-  if (!matrix_loaded) {
-    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);  // Only needed for debug printing
-    AlltoAllvParseEnv();
-    AlltoAllvReadTrafficMatrix(nranks);
-    matrix_loaded = true;
-  }
-
-  // Calculate maximum send/receive counts across ALL ranks
-  *sendcount = 0;
-  *recvcount = 0;
-
-  for (int i = 0; i < nranks; i++) {
-    size_t rank_sendbytes = 0;
-    size_t rank_recvbytes = 0;
-
-    for (int j = 0; j < nranks; j++) {
-      rank_sendbytes += traffic_matrix[i][j];  // What rank i sends total
-      rank_recvbytes += traffic_matrix[j][i];  // What rank i receives total
-    }
-
-    DEBUG_PRINT_ALL("Rank %d: send %zu bytes, recv %zu bytes", i, rank_sendbytes, rank_recvbytes);
-
-    *sendcount = std::max(*sendcount, rank_sendbytes/eltSize);
-    *recvcount = std::max(*recvcount, rank_recvbytes/eltSize);
-  }
-
-  DEBUG_PRINT_ALL("Max buffer sizes - Send: %zu, Recv: %zu", *sendcount * eltSize, *recvcount * eltSize);
-
-  // Avoid recalculating this later
-  global_max_send_count = *sendcount;
-  global_max_recv_count = *recvcount;
-
-  // For AlltoAllv, paramcount isn't used in the traditional sense since we don't call
-  // a single NCCL collective. However, we need to set it for interface compatibility.
-  // We'll use the overall input count divided by the number of ranks as a representative value.
-  *paramcount = (count/nranks) & -(16/eltSize);
-
-  // AlltoAllv doesn't support in-place operations
+  // derive a representative per-peer element count from the matrix maximums
+  size_t max_count = std::max(global_max_send_bytes, global_max_recv_bytes) / eltSize;
+  *paramcount = (max_count / nranks) & -(16/eltSize);
+  // use precomputed byte maximums divided by element size
+  *sendcount = global_max_send_bytes / eltSize;
+  *recvcount = global_max_recv_bytes / eltSize;
+  // alltoAllv doesn't support in-place operations
   *sendInplaceOffset = 0;
   *recvInplaceOffset = 0;
 }
@@ -206,9 +169,9 @@ testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncc
 }
 
 void AlltoAllvGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
-  // use max send or recv count across all ranks
-  size_t max_sendrecv_count = std::max(global_max_send_count, global_max_recv_count);
-  double baseBw = (double)(max_sendrecv_count * typesize) / 1.0E9 / sec;
+  // use max send or recv bytes across all ranks
+  size_t max_sendrecv_bytes = std::max(global_max_send_bytes, global_max_recv_bytes);
+  double baseBw = (double)max_sendrecv_bytes / 1.0E9 / sec;
 
   *algBw = baseBw;
   double factor = ((double)(nranks-1))/((double)(nranks));
@@ -259,20 +222,46 @@ struct testColl alltoAllvTest = {
 };
 
 void AlltoAllvGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {
-  size_t paramcount, sendInplaceOffset, recvInplaceOffset;
-  AlltoAllvGetCollByteCount(sendcount, recvcount, &paramcount, &sendInplaceOffset, &recvInplaceOffset, count, /*eltSize=*/1, nranks);
+  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);  // for debug printing
+  AlltoAllvParseEnv();
+  AlltoAllvReadTrafficMatrix(nranks);
+
+  // calculate max send and recv bytes across all ranks
+  size_t max_send_bytes = 0;
+  size_t max_recv_bytes = 0;
+  for (int i = 0; i < nranks; i++) {
+    size_t rank_sendbytes = 0;
+    size_t rank_recvbytes = 0;
+    for (int j = 0; j < nranks; j++) {
+      rank_sendbytes += traffic_matrix[i][j];
+      rank_recvbytes += traffic_matrix[j][i];
+    }
+    DEBUG_PRINT_ALL("Rank %d: send %zu bytes, recv %zu bytes", i, rank_sendbytes, rank_recvbytes);
+    if (rank_sendbytes > max_send_bytes) max_send_bytes = rank_sendbytes;
+    if (rank_recvbytes > max_recv_bytes) max_recv_bytes = rank_recvbytes;
+  }
+  global_max_send_bytes = max_send_bytes;
+  global_max_recv_bytes = max_recv_bytes;
+  DEBUG_PRINT_ALL("Max buffer sizes - Send: %zu, Recv: %zu", global_max_send_bytes, global_max_recv_bytes);
+
+  // eltSize=1 is expected here, so output counts are bytes
+  *sendcount = global_max_send_bytes;
+  *recvcount = global_max_recv_bytes;
 }
 
 testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t type, const char* typeName, ncclRedOp_t op, const char* opName) {
   args->collTest = &alltoAllvTest;
-
-  if (args->minbytes != args->maxbytes) {
-    FATAL_ERROR("AlltoAllv requires single size testing. Set -b and -e to the same value (e.g., -b 32M -e 32M).");
-  }
-
   ncclDataType_t *run_types;
   const char **run_typenames;
   int type_count;
+
+  if (args->minbytes != args->maxbytes) {
+    FATAL_ERROR("AlltoAllv requires -b and -e options to be set to the same value (e.g., -b 32M -e 32M).");
+  }
+  size_t total_bytes_req = std::max(global_max_send_bytes, global_max_recv_bytes);
+  if (args->maxbytes < total_bytes_req) {
+    FATAL_ERROR("AlltoAllv requires at least %zu bytes (from input traffic matrix), but maxBytes (-e) is %zu. Increase -e.", total_bytes_req, args->maxbytes);
+  }
 
   if ((int)type != -1) {
     type_count = 1;
@@ -285,14 +274,6 @@ testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t 
   }
 
   for (int i=0; i<type_count; i++) {
-    // send/recv buffers allocated by common code are based on configured maxbytes (-e option)
-    // we need to ensure that the total bytes required from the matrix is lte to maxbytes
-    size_t max_elements = std::max(global_max_send_count, global_max_recv_count);
-    size_t total_bytes = max_elements * wordSize(run_types[i]);
-    if (args->maxbytes < total_bytes) {
-      FATAL_ERROR("AlltoAllv requires at least %zu bytes (from input traffic matrix), but maxBytes (-e) is %zu. Increase -e.", total_bytes, args->maxbytes);
-    }
-
     TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], (ncclRedOp_t)0, "none", -1));
   }
   return testSuccess;
