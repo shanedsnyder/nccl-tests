@@ -206,7 +206,7 @@ testResult_t AlltoAllvInitData(struct threadArgs* args, ncclDataType_t type, ncc
 }
 
 void AlltoAllvGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
-  // Use max send or recv count across all ranks
+  // use max send or recv count across all ranks
   size_t max_sendrecv_count = std::max(global_max_send_count, global_max_recv_count);
   double baseBw = (double)(max_sendrecv_count * typesize) / 1.0E9 / sec;
 
@@ -285,9 +285,13 @@ testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t 
   }
 
   for (int i=0; i<type_count; i++) {
-    // Set maxbytes for this specific data type to ensure steps=1 (shift=0)
+    // send/recv buffers allocated by common code are based on configured maxbytes (-e option)
+    // we need to ensure that the total bytes required from the matrix is lte to maxbytes
     size_t max_elements = std::max(global_max_send_count, global_max_recv_count);
-    //args->maxbytes = max_elements * wordSize(run_types[i]);
+    size_t total_bytes = max_elements * wordSize(run_types[i]);
+    if (args->maxbytes < total_bytes) {
+      FATAL_ERROR("AlltoAllv requires at least %zu bytes (from input traffic matrix), but maxBytes (-e) is %zu. Increase -e.", total_bytes, args->maxbytes);
+    }
 
     TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], (ncclRedOp_t)0, "none", -1));
   }
